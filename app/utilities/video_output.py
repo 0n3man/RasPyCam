@@ -15,6 +15,8 @@ class RecordingOutput(FfmpegOutput):
     MAX_BYTES = 8 * 1024 * 1024
     MAX_FRAMES = 64
     WRITE_TIMEOUT = 3.0
+    STARTUP_TIMEOUT = 15.0
+    STARTUP_MAX_FRAMES = 512
 
     def outputframe(self, frame, keyframe=True, timestamp=None, packet=None, audio=False):
         if audio:
@@ -25,7 +27,9 @@ class RecordingOutput(FfmpegOutput):
         with self._condition:
             if self._closing or self._error is not None:
                 return
-            if len(self._queue) >= self.MAX_FRAMES or self._bytes + len(frame) > self.MAX_BYTES:
+            frame_limit = (self.STARTUP_MAX_FRAMES if time.monotonic() < self._startup_deadline
+                           else self.MAX_FRAMES)
+            if len(self._queue) >= frame_limit or self._bytes + len(frame) > self.MAX_BYTES:
                 self._error = RuntimeError("FFmpeg output queue capacity exceeded")
             else:
                 self._queue.append((bytes(frame), timestamp))
@@ -35,12 +39,12 @@ class RecordingOutput(FfmpegOutput):
     def _write_frame(self, frame):
         fd = self._process.stdin.fileno()
         remaining = memoryview(frame)
-        deadline = time.monotonic() + self.WRITE_TIMEOUT
+        deadline = max(time.monotonic() + self.WRITE_TIMEOUT, self._startup_deadline)
         while remaining:
             if self._abort.is_set():
                 raise RuntimeError("FFmpeg output drain deadline exceeded")
             if time.monotonic() >= deadline:
-                raise TimeoutError("FFmpeg pipe write stalled for 3 seconds")
+                raise TimeoutError("FFmpeg pipe write exceeded startup allowance or write deadline")
             try:
                 written = os.write(fd, remaining)
                 if not written:
@@ -103,6 +107,7 @@ class RecordingOutput(FfmpegOutput):
         command.append(self.output_filename)
         self.ffmpeg = subprocess.Popen(command, stdin=subprocess.PIPE, bufsize=0, start_new_session=True)
         self._process = self.ffmpeg
+        self._startup_deadline = time.monotonic() + self.STARTUP_TIMEOUT
         diagnostics.event(f"FFmpeg started pid={self.ffmpeg.pid} output={self.output_filename}")
         os.set_blocking(self._process.stdin.fileno(), False)
         Output.start(self)
@@ -111,6 +116,18 @@ class RecordingOutput(FfmpegOutput):
 
     def stop(self):
         Output.stop(self)
+        # Picamera2 calls this while holding its encoder lock. The application
+        # opts into two-phase stop so it can wait after stop_encoder returns.
+        if getattr(self, "defer_finalization", False):
+            if getattr(self, "_process", None) is not None:
+                with self._condition:
+                    self._closing = True
+                    self._condition.notify()
+            return
+        self.finish()
+
+    def finish(self):
+        """Drain and reap FFmpeg without holding Picamera2's encoder lock."""
         process = getattr(self, "_process", None)
         if process is None:
             return
@@ -127,6 +144,7 @@ class RecordingOutput(FfmpegOutput):
             try:
                 returncode = process.wait(timeout=5)
             except subprocess.TimeoutExpired:
+                diagnostics.process_snapshot(process.pid)
                 process.terminate()
                 try:
                     process.wait(timeout=2)

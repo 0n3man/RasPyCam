@@ -2,6 +2,7 @@ import os
 import logging
 from utilities import diagnostics
 from picamera2.outputs import FileOutput
+from utilities.video_output import RecordingOutput
 from utilities.video_output import RecordingOutput as FfmpegOutput
 
 
@@ -83,20 +84,39 @@ def stop_recording(cam):
         cam.print_to_logfile("Already stopped. Ignore")
         return False
     diagnostics.event("recording stop requested")
+    output = cam.video_encoder.output
+    deferred = isinstance(output, RecordingOutput)
+    if deferred:
+        output.defer_finalization = True
+    finalized = True
     try:
-        if cam.video_encoder.running:
-            cam.picam2.stop_encoder(cam.video_encoder)
-        else:
-            cam.video_encoder.output.stop()
+        try:
+            if cam.video_encoder.running:
+                cam.picam2.stop_encoder(cam.video_encoder)
+            else:
+                output.stop()
+        finally:
+            # stop_encoder has now released its lock and removed the encoder.
+            if deferred:
+                try:
+                    output.finish()
+                except Exception as error:
+                    finalized = False
+                    logging.exception("Recording finalization failed; camera remains available")
+                    cam.print_to_logfile(f"Recording finalization failed: {error}")
+                    diagnostics.incident(f"Recording finalization failed: {error}")
     finally:
+        if deferred:
+            output.defer_finalization = False
         cam.capturing_video = False
         cam.record_until = None
+        cam.recording_error = None
         cam.reset_motion_state()
-    diagnostics.event("recording stopped")
+    diagnostics.event(f"recording stopped; finalized={finalized}")
     cam.set_status("ready")
-    cam.print_to_logfile("Capturing stopped")
-
-    return True
+    if finalized:
+        cam.print_to_logfile("Capturing stopped")
+    return finalized
 
 
 def toggle_cam_record(cam, status):

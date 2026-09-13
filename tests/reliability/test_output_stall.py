@@ -15,6 +15,7 @@ class StalledOutputTests(unittest.TestCase):
                                    stdin=subprocess.PIPE, bufsize=0)
         output = RecordingOutput('/tmp/unused.mp4')
         output.WRITE_TIMEOUT = 0.2
+        output.STARTUP_TIMEOUT = 0.2
         self.failed = threading.Event()
         output.error_callback = lambda error: self.failed.set()
         with patch('utilities.video_output.subprocess.Popen', return_value=process):
@@ -57,3 +58,46 @@ class StalledOutputTests(unittest.TestCase):
         output.stop()
         process.terminate.assert_called_once()
         self.assertIsNone(output._process)
+
+    def test_delayed_reader_can_exceed_normal_write_deadline_at_startup(self):
+        process = subprocess.Popen([sys.executable, '-c',
+            'import time, sys; time.sleep(0.5); sys.stdin.buffer.read()'],
+            stdin=subprocess.PIPE, bufsize=0)
+        output = RecordingOutput('/tmp/unused.mp4')
+        output.WRITE_TIMEOUT = 0.1
+        output.STARTUP_TIMEOUT = 2
+        with patch('utilities.video_output.subprocess.Popen', return_value=process):
+            output.start()
+        try:
+            output.outputframe(b'x' * 1000000)
+            output.stop()
+            self.assertIsNone(output._error)
+            self.assertEqual(process.returncode, 0)
+        finally:
+            output.stop()
+
+    def test_expired_startup_window_uses_short_deadline(self):
+        with patch('utilities.video_output.diagnostics.incident'), patch('utilities.video_output.diagnostics.process_snapshot'):
+            output = self.start_nonreader()
+            output._startup_deadline = time.monotonic() - 1
+            output.outputframe(b'x' * 1000000)
+            self.assertTrue(self.failed.wait(0.8))
+            self.assertIsInstance(output._error, TimeoutError)
+            output.stop()
+
+    def test_startup_queue_can_hold_more_frames_without_growing_byte_cap(self):
+        output = RecordingOutput('/tmp/unused.mp4')
+        output.recording = True
+        output._condition = threading.Condition()
+        output._closing = False
+        output._error = None
+        from collections import deque
+        output._queue = deque()
+        output._bytes = 0
+        output._startup_deadline = time.monotonic() + 15
+        for _ in range(100):
+            output.outputframe(b'x' * 100)
+        self.assertIsNone(output._error)
+        output.MAX_BYTES = output._bytes
+        output.outputframe(b'x')
+        self.assertIn('capacity', str(output._error))

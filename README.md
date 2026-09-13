@@ -335,3 +335,20 @@ existing shutdown and watchdog recovery path. FFmpeg `/proc` status, wait channe
 syscall and I/O counters are captured on writer failure where permissions permit.
 Normal stop drains the queue for up to four seconds before canceling writes, then
 uses bounded FFmpeg process cleanup. The diagnostic log size limit is unchanged.
+
+
+FFmpeg receives a 15-second startup grace window after process launch, shared
+across early frame writes (not renewed for each frame). After that window,
+individual writes retain their three-second deadline. During startup the queue
+allows up to 512 queued frames rather than 64, so the frame-count limit does not
+cancel the grace window after roughly two seconds. The 8 MiB encoded-data cap
+is unchanged and can still end a recording early if exhausted. Stop/drain
+limits are unchanged. This allows slow initial program/library reads while
+keeping CPU, queue memory, and failure recovery bounded.
+
+Recording stop uses two phases: Picamera2 stops/removes the encoder first,
+then the application drains and reaps FFmpeg outside the encoder lock. This
+allows preview/motion frame processing during file finalization. A finalization
+failure is logged and returns the camera to ready; encoder/driver stop failures
+still propagate into camera recovery. Existing drain and process deadlines
+remain in force, and failed finalization is not reported as successful capture.
